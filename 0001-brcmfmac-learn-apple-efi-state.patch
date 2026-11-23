@@ -1,0 +1,161 @@
+From d24ab7547fd85595a2ad5ab0bdfec3b816e268e9 Mon Sep 17 00:00:00 2001
+From: sqlwwx <7932813+sqlwwx@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 17:08:54 +0800
+Subject: [PATCH] brcmfmac: learn Apple EFI GPIO/chipcontrol state instead of
+ hardcoding it
+
+BCM43602 (106b:0157) loses the GPIO 12-14 pad routing and the PMU
+chipcontrol state that Apple's EFI programs when the module loses power in
+suspend. After resume every 5 GHz join fails while 2.4 GHz keeps working.
+
+The existing patch for this problem hardcodes the PMU triple dumped from
+one MacBookPro14,2. This version instead snapshots the state from the chip
+on the first attach after a cold boot and replays that snapshot on resume,
+so it does not depend on values copied from another machine.
+
+On the machine used for testing the learned values matched the hardcoded
+ones exactly (chipcontrol 01400090, gpioout 00006000, gpioouten 00007000,
+pmu 100001ce 903aaa2a 16058048), which suggests the state is generic for
+this chip plus Apple EFI rather than board specific.
+
+Verified on MacBookPro14,2 / BCM43602 14e4:43ba / subsystem 106b:0157,
+kernel 7.2.15-1-omarchy: after a cold boot the module logs "learned Apple
+EFI state", and after a suspend/resume cycle it logs "restored Apple EFI
+GPIO/chipcontrol state (was chipcontrol 00000000 gpioout 00000000
+gpioouten 00000000)" -- S3 zeroes the registers completely. Both 2.4 GHz
+and 5 GHz work after cold boot and after resume.
+---
+ .../broadcom/brcm80211/brcmfmac/pcie.c        | 113 ++++++++++++++++++
+ 1 file changed, 113 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index 55f4d7b..9cf5d7e 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -712,10 +712,123 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
+ }
+ 
+ 
++/*
++ * Apple MacBookPro14,2 (BCM43602, subsystem 106b:0157): Apple's EFI routes
++ * GPIO 12-14 to the pads (chipcommon chipcontrol) and drives them as outputs
++ * with 13 and 14 high, presumably for the external 5 GHz front end; the
++ * firmware never sets this up itself. The state survives a chip reset but is
++ * lost when the module loses power in suspend, after which every 5 GHz join
++ * fails with E_AUTH status NO_ACK until the next cold boot. Put back the
++ * cold-boot values before each firmware download if they are missing.
++ */
++static bool brcmf_apple_fixup = true;
++module_param_named(apple_43602_fixup, brcmf_apple_fixup, bool, 0444);
++MODULE_PARM_DESC(apple_43602_fixup,
++		 "Restore Apple EFI GPIO/chipcontrol state on MacBookPro14,2 (default: on)");
++
++/*
++ * Learned snapshot. On the first attach after a cold boot the chip still holds
++ * whatever Apple's EFI programmed, so we record it instead of trusting values
++ * copied from another machine. Later attaches (resume) replay the snapshot.
++ * If no snapshot exists yet the compiled-in fallback is used.
++ */
++static bool brcmf_apple_snap_valid;
++static u32 brcmf_apple_snap_cc_chipctl;
++static u32 brcmf_apple_snap_gpioout;
++static u32 brcmf_apple_snap_gpioouten;
++static u32 brcmf_apple_snap_pullup;
++static u32 brcmf_apple_snap_pulldown;
++static u32 brcmf_apple_snap_pmu[3];
++
++#define BRCMF_APPLE_43602_SUBSYS	0x0157
++#define BRCMF_APPLE_GPIO_MASK		0x7000
++#define BRCMF_APPLE_GPIO_OUT		0x6000
++#define BRCMF_APPLE_CC_CHIPCTL		0x01400090
++
++/* PMU chipcontrol[1..3] as Apple's EFI leaves them */
++static const u32 brcmf_apple_pmu_chipctl[] = { 0x100001ce, 0x903aaa2a, 0x16058048 };
++
++static u32 brcmf_pcie_buscore_read32(void *ctx, u32 addr);
++static void brcmf_pcie_buscore_write32(void *ctx, u32 addr, u32 value);
++
++static void brcmf_pcie_apple_43602_fixup(struct brcmf_pciedev_info *devinfo)
++{
++	struct pci_dev *pdev = devinfo->pdev;
++	struct brcmf_core *cc, *pmu;
++	u32 ctl, out, outen, pullup, pulldown;
++	int i;
++
++	if (!brcmf_apple_fixup || devinfo->ci->chip != BRCM_CC_43602_CHIP_ID ||
++	    pdev->subsystem_vendor != PCI_VENDOR_ID_APPLE ||
++	    pdev->subsystem_device != BRCMF_APPLE_43602_SUBSYS)
++		return;
++
++	cc = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_CHIPCOMMON);
++	pmu = brcmf_chip_get_pmu(devinfo->ci);
++	ctl = brcmf_pcie_buscore_read32(devinfo, CORE_CC_REG(cc->base, chipcontrol));
++	out = brcmf_pcie_buscore_read32(devinfo, CORE_CC_REG(cc->base, gpioout));
++	outen = brcmf_pcie_buscore_read32(devinfo, CORE_CC_REG(cc->base, gpioouten));
++	pullup = brcmf_pcie_buscore_read32(devinfo, CORE_CC_REG(cc->base, gpiopullup));
++	pulldown = brcmf_pcie_buscore_read32(devinfo, CORE_CC_REG(cc->base, gpiopulldown));
++
++	/* Snapshot the state only when it looks like Apple's EFI set it up. */
++	if (!brcmf_apple_snap_valid &&
++	    (ctl & BRCMF_APPLE_CC_CHIPCTL) == BRCMF_APPLE_CC_CHIPCTL &&
++	    (outen & BRCMF_APPLE_GPIO_MASK) == BRCMF_APPLE_GPIO_MASK &&
++	    (out & BRCMF_APPLE_GPIO_MASK) == BRCMF_APPLE_GPIO_OUT) {
++		brcmf_apple_snap_cc_chipctl = ctl;
++		brcmf_apple_snap_gpioout = out;
++		brcmf_apple_snap_gpioouten = outen;
++		brcmf_apple_snap_pullup = pullup;
++		brcmf_apple_snap_pulldown = pulldown;
++		for (i = 0; i < ARRAY_SIZE(brcmf_apple_snap_pmu); i++) {
++			brcmf_pcie_buscore_write32(devinfo,
++						   CORE_CC_REG(pmu->base, chipcontrol_addr), i + 1);
++			brcmf_apple_snap_pmu[i] = brcmf_pcie_buscore_read32(devinfo,
++						   CORE_CC_REG(pmu->base, chipcontrol_data));
++		}
++		brcmf_apple_snap_valid = true;
++		dev_info(&pdev->dev,
++			 "learned Apple EFI state: chipcontrol %08x gpioout %08x gpioouten %08x pmu %08x %08x %08x\n",
++			 ctl, out, outen, brcmf_apple_snap_pmu[0],
++			 brcmf_apple_snap_pmu[1], brcmf_apple_snap_pmu[2]);
++		return;
++	}
++
++	if ((ctl & BRCMF_APPLE_CC_CHIPCTL) == BRCMF_APPLE_CC_CHIPCTL &&
++	    (outen & BRCMF_APPLE_GPIO_MASK) == BRCMF_APPLE_GPIO_MASK &&
++	    (out & BRCMF_APPLE_GPIO_MASK) == BRCMF_APPLE_GPIO_OUT)
++		return;
++
++	brcmf_pcie_buscore_write32(devinfo, CORE_CC_REG(cc->base, gpiopullup),
++				   pullup & ~BRCMF_APPLE_GPIO_MASK);
++	brcmf_pcie_buscore_write32(devinfo, CORE_CC_REG(cc->base, gpiopulldown),
++				   pulldown & ~BRCMF_APPLE_GPIO_MASK);
++	brcmf_pcie_buscore_write32(devinfo, CORE_CC_REG(cc->base, gpioout),
++				   (out & ~BRCMF_APPLE_GPIO_MASK) | BRCMF_APPLE_GPIO_OUT);
++	brcmf_pcie_buscore_write32(devinfo, CORE_CC_REG(cc->base, gpioouten),
++				   outen | BRCMF_APPLE_GPIO_MASK);
++	brcmf_pcie_buscore_write32(devinfo, CORE_CC_REG(cc->base, chipcontrol),
++				   ctl | BRCMF_APPLE_CC_CHIPCTL);
++	for (i = 0; i < ARRAY_SIZE(brcmf_apple_pmu_chipctl); i++) {
++		brcmf_pcie_buscore_write32(devinfo,
++					   CORE_CC_REG(pmu->base, chipcontrol_addr), i + 1);
++		brcmf_pcie_buscore_write32(devinfo,
++					   CORE_CC_REG(pmu->base, chipcontrol_data),
++					   brcmf_apple_snap_valid ? brcmf_apple_snap_pmu[i]
++								  : brcmf_apple_pmu_chipctl[i]);
++	}
++	dev_info(&pdev->dev,
++		 "restored Apple EFI GPIO/chipcontrol state (was chipcontrol %08x gpioout %08x gpioouten %08x)\n",
++		 ctl, out, outen);
++}
++
+ static void brcmf_pcie_attach(struct brcmf_pciedev_info *devinfo)
+ {
+ 	u32 config;
+ 
++	brcmf_pcie_apple_43602_fixup(devinfo);
++
+ 	/* BAR1 window may not be sized properly */
+ 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
+ 	brcmf_pcie_write_reg32(devinfo, BRCMF_PCIE_PCIE2REG_CONFIGADDR, 0x4e0);
+-- 
+2.56.0
+

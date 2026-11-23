@@ -1,0 +1,4 @@
+linux-*/
+*.tar.xz
+*.ko
+*.o
