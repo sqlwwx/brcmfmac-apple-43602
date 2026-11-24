@@ -71,17 +71,31 @@ patch -p1 < /path/to/0001-brcmfmac-learn-apple-efi-state.patch
 
 # 4. build only brcmfmac
 make olddefconfig && make -j$(nproc) prepare
-make -j$(nproc) LOCALVERSION="" KCFLAGS="-DDEBUG" \
+make -j$(nproc) KCFLAGS="-DDEBUG" \
      M=drivers/net/wireless/broadcom/brcm80211/brcmfmac modules
+
+# 5. verify before installing -- a wrong vermagic is refused at load time
+modinfo -F vermagic drivers/net/wireless/broadcom/brcm80211/brcmfmac/brcmfmac.ko
+# must print exactly your `uname -r`, e.g. "7.2.15-5-omarchy SMP preempt ..."
 ```
 
-`build.sh` in this repo automates the Omarchy-specific parts.
+`build.sh` in this repo automates the Omarchy-specific parts, including the
+vermagic check and the git tag described below.
 
-### Three build gotchas
+### Four build gotchas
 
-1. **`LOCALVERSION=""` is required.** With `CONFIG_LOCALVERSION_AUTO=y`, vermagic
-   becomes `7.2.15-g<sha>` and the module is refused at load time. Also set
-   `CONFIG_LOCALVERSION="-1-omarchy"` and disable `LOCALVERSION_AUTO` in `.config`.
+1. **The source tree must carry a git tag matching `KERNELVERSION`.** Otherwise
+   `scripts/setlocalversion` appends `+` and vermagic becomes
+   `7.2.15-5-omarchy+`, which the kernel refuses to load. A dirty tree and a
+   tagless tree both trigger this. Tag the baseline once:
+   `git tag -a v7.2.15 -m baseline`, then delete `include/config/kernel.release`
+   and `include/generated/utsrelease.h` so the version is recomputed.
+   Do **not** try to fix it with `LOCALVERSION=""`: an empty override is exactly
+   what makes setlocalversion fall into the "append +" branch, and passing the
+   version explicitly (`LOCALVERSION=-5-omarchy`) gets it appended twice
+   (`7.2.15-5-omarchy-5-omarchy`) because `.config` already carries
+   `CONFIG_LOCALVERSION`. Set `CONFIG_LOCALVERSION` in `.config`, disable
+   `CONFIG_LOCALVERSION_AUTO`, and tag the tree.
 2. **`KCFLAGS="-DDEBUG"` is required.** With `CONFIG_BRCMDBG=y`, `debug.h`
    declares the debugfs helpers only under `DEBUG`, but `M=` builds skip the
    parent Makefile's `subdir-ccflags-$(CONFIG_BRCMDBG) += -DDEBUG`, so `debug.c`
@@ -89,6 +103,10 @@ make -j$(nproc) LOCALVERSION="" KCFLAGS="-DDEBUG" \
 3. **`scripts/module.lds` must exist.** Without it `make` reports
    "no rule to make target brcmfmac.ko", which looks like a missing target
    definition but is really a missing prerequisite. `make scripts/module.lds`.
+4. **Re-run this after every kernel upgrade.** `updates/` is versioned by
+   vermagic, so a new kernel silently falls back to the unpatched module and
+   5 GHz stops working again. Nothing carries the module over; `pacman`'s
+   module-save hooks only preserve the same KVER.
 
 Note that `/usr/src/linux-omarchy` on Omarchy ships only Kconfig files — every
 `.c` under `drivers/net/wireless` is stripped — so you cannot build in place.

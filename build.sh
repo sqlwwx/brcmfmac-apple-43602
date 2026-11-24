@@ -53,16 +53,40 @@ fi
 echo "==> preparing"
 make olddefconfig
 command -v bc >/dev/null || { echo "ERROR: install bc (kernel build needs it)"; exit 1; }
+
+# scripts/setlocalversion appends "+" when the source tree has no git tag that
+# matches KERNELVERSION, which breaks vermagic (7.2.15-N-omarchy+ is refused at
+# load time). Tag the baseline once so the version comes out clean.
+if [ -d .git ] && ! git rev-parse -q --verify "refs/tags/v$BASE" >/dev/null 2>&1; then
+    echo "==> tagging baseline v$BASE (setlocalversion needs a matching tag)"
+    git tag -a "v$BASE" -m "vanilla linux $BASE baseline" 2>/dev/null || true
+fi
+rm -f include/config/kernel.release include/generated/utsrelease.h
+
 make -j"$(nproc)" prepare
 make scripts/module.lds
 
+# The version baked into the module comes from include/config/kernel.release,
+# which `prepare` regenerated from CONFIG_LOCALVERSION above. Do NOT pass
+# LOCALVERSION="" here: an empty override makes scripts/setlocalversion append
+# "+" whenever the git tree is dirty, and the resulting vermagic
+# (7.2.15-N-omarchy+) is refused at load time.
 echo "==> building brcmfmac only (the kernel itself is never rebuilt)"
+echo "    module will report vermagic $(cat include/config/kernel.release 2>/dev/null)"
 # KCFLAGS=-DDEBUG: CONFIG_BRCMDBG=y makes debug.h declare the debugfs helpers
 # only under DEBUG, and M= builds skip the parent Makefile that adds it.
-make -j"$(nproc)" LOCALVERSION="" KCFLAGS="-DDEBUG" M="$MODDIR" modules
+make -j"$(nproc)" KCFLAGS="-DDEBUG" M="$MODDIR" modules
 
 strip --strip-debug "$MODDIR/brcmfmac.ko"
-echo "==> built $(du -h "$MODDIR/brcmfmac.ko" | cut -f1) $MODDIR/brcmfmac.ko"
+
+# Refuse to install a module the running kernel will reject.
+GOT=$(modinfo -F vermagic "$MODDIR/brcmfmac.ko" 2>/dev/null | awk '{print $1}')
+if [ "$GOT" != "$KV" ]; then
+    echo "ERROR: vermagic '$GOT' != running kernel '$KV'; refusing to install." >&2
+    echo "       (a '+' suffix means setlocalversion saw a dirty git tree)" >&2
+    exit 1
+fi
+echo "==> built $(du -h "$MODDIR/brcmfmac.ko" | cut -f1) $MODDIR/brcmfmac.ko (vermagic ok)"
 
 DEST="/usr/lib/modules/$KV/updates/brcmfmac"
 sudo mkdir -p "$DEST"
